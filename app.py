@@ -62,18 +62,26 @@ class IVASSMSClient:
                     logger.debug("Loaded cookies from file")
             
             if isinstance(cookies_raw, dict):
-                logger.debug("Cookies loaded as dictionary")
-                return cookies_raw
+                cookies = cookies_raw
             elif isinstance(cookies_raw, list):
-                cookies = {}
-                for cookie in cookies_raw:
-                    if 'name' in cookie and 'value' in cookie:
-                        cookies[cookie['name']] = cookie['value']
-                logger.debug("Cookies loaded as list")
-                return cookies
+                cookies = {
+                    item['name']: item['value']
+                    for item in cookies_raw
+                    if isinstance(item, dict) and item.get('name') and item.get('value')
+                }
             else:
-                logger.error("Cookies are in an unsupported format")
-                raise ValueError("Cookies are in an unsupported format.")
+                raise ValueError("Cookies must be a JSON object or a list of cookie objects.")
+
+            # Reject malformed entries without ever logging cookie values.
+            cookies = {
+                str(name): str(value)
+                for name, value in cookies.items()
+                if isinstance(name, str) and name.strip() and isinstance(value, (str, int, float)) and str(value)
+            }
+            if not cookies:
+                raise ValueError("No usable cookies were found.")
+            logger.info("Loaded %d cookie(s) from configuration", len(cookies))
+            return cookies
         except FileNotFoundError:
             logger.error("cookies.json file not found")
             return None
@@ -91,12 +99,30 @@ class IVASSMSClient:
             logger.error("No valid cookies loaded")
             return False
         
+        # Keep the cookie names exactly as supplied by the IVASMS browser session.
         for name, value in cookies.items():
-            self.scraper.cookies.set(name, value, domain="www.ivasms.com")
-        
+            self.scraper.cookies.set(name, value, domain="www.ivasms.com", path="/")
+
         try:
-            response = self.scraper.get(f"{self.base_url}/portal/sms/received", timeout=10)
-            logger.debug(f"Response headers: {response.headers}")
+            response = self.scraper.get(
+                f"{self.base_url}/portal/sms/received",
+                headers={"Referer": f"{self.base_url}/", "Accept": "text/html,application/xhtml+xml"},
+                timeout=15,
+                allow_redirects=True,
+            )
+            # Log only non-secret response metadata. Never log cookies or tokens.
+            safe_headers = {
+                key: response.headers.get(key)
+                for key in ("Server", "CF-Ray", "Content-Type", "Location")
+                if response.headers.get(key)
+            }
+            logger.info(
+                "IVASMS login response: status=%s final_host=%s headers=%s body_bytes=%s",
+                response.status_code,
+                getattr(response, "url", "").split("/", 3)[2] if getattr(response, "url", "") else "unknown",
+                safe_headers,
+                len(response.content),
+            )
             if response.status_code == 200:
                 html_content = self.decompress_response(response)
                 soup = BeautifulSoup(html_content, 'html.parser')
@@ -104,14 +130,15 @@ class IVASSMSClient:
                 if csrf_input:
                     self.csrf_token = csrf_input.get('value')
                     self.logged_in = True
-                    logger.debug(f"Logged in successfully with CSRF token: {self.csrf_token}")
+                    logger.info("IVASMS session initialized; CSRF token was found")
                     return True
                 else:
-                    logger.error("Could not find CSRF token. Dumping response HTML for debugging:")
-                    logger.error(f"Response HTML (first 2000 chars): {html_content[:2000]}")
-                    logger.error(f"Full response length: {len(html_content)}")
+                    logger.error(
+                        "IVASMS returned HTTP 200 but no _token field was found (body_bytes=%d)",
+                        len(response.content),
+                    )
                     return False
-            logger.error(f"Login failed with status code: {response.status_code}")
+            logger.error("IVASMS login request was rejected with HTTP %s", response.status_code)
             return False
         except Exception as e:
             logger.error(f"Login error: {e}")
@@ -183,10 +210,9 @@ class IVASSMSClient:
                     'revenue': revenue_sms,
                     'sms_details': sms_details
                 }
-                result['raw_response'] = html_content
-                logger.debug(f"Retrieved {len(sms_details)} SMS detail records: {sms_details}")
+                logger.info("Retrieved SMS summary with %d range record(s)", len(sms_details))
                 return result
-            logger.error(f"Failed to check OTPs. Status code: {response.status_code}, Response: {self.decompress_response(response)[:2000]}")
+            logger.error("Failed to check OTPs. HTTP status: %s", response.status_code)
             return None
         except Exception as e:
             logger.error(f"Error checking OTPs: {e}")
@@ -245,7 +271,7 @@ class IVASSMSClient:
                     })
                 logger.debug(f"Retrieved {len(number_details)} number details for range {phone_range}: {number_details}")
                 return number_details
-            logger.error(f"Failed to get SMS details for {phone_range}. Status code: {response.status_code}, Response: {self.decompress_response(response)[:2000]}")
+            logger.error("Failed to get SMS details. HTTP status: %s", response.status_code)
             return None
         except Exception as e:
             logger.error(f"Error getting SMS details for {phone_range}: {e}")
@@ -256,7 +282,7 @@ class IVASSMSClient:
             logger.error("Not logged in")
             return None
         
-        logger.debug(f"Fetching OTP message for phone: {phone_number}, range: {phone_range}, from {from_date} to {to_date}")
+        logger.debug("Fetching OTP message for requested number and range")
         try:
             payload = {
                 '_token': self.csrf_token,
@@ -285,12 +311,12 @@ class IVASSMSClient:
                 html_content = self.decompress_response(response)
                 soup = BeautifulSoup(html_content, 'html.parser')
                 message = soup.select_one(".col-9.col-sm-6 p").text.strip() if soup.select_one(".col-9.col-sm-6 p") else None
-                logger.debug(f"Retrieved OTP message for {phone_number}: {message}")
+                logger.info("Retrieved OTP message for requested number (message content omitted from logs)")
                 return message
-            logger.error(f"Failed to get OTP message for {phone_number}. Status code: {response.status_code}, Response: {self.decompress_response(response)[:2000]}")
+            logger.error("Failed to get OTP message. HTTP status: %s", response.status_code)
             return None
         except Exception as e:
-            logger.error(f"Error getting OTP message for {phone_number}: {e}")
+            logger.error("Error getting OTP message: %s", type(e).__name__)
             return None
 
     def get_all_otp_messages(self, sms_details, from_date="", to_date="", limit=None):
@@ -314,7 +340,7 @@ class IVASSMSClient:
                             'phone_number': phone_number,
                             'otp_message': otp_message
                         })
-                        logger.debug(f"Added OTP message for {phone_number}: {otp_message}")
+                        logger.debug("Added an OTP message (content omitted from logs)")
             else:
                 logger.warning(f"No number details found for range: {phone_range}")
         
@@ -374,8 +400,11 @@ def get_sms():
         limit = None
 
     if not client.logged_in:
+        logger.info("Client is not authenticated; retrying IVASMS session initialization")
+        client.login_with_cookies()
+    if not client.logged_in:
         return jsonify({
-            'error': 'Client not authenticated'
+            'error': 'IVASMS session is not authenticated. Refresh COOKIES_JSON and redeploy if the session expired.'
         }), 401
     
     logger.debug(f"Fetching SMS for date range: {from_date} to {to_date or 'empty'} with limit {limit}")
